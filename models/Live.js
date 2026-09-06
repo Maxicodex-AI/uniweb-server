@@ -7,11 +7,25 @@ const liveSchema = new mongoose.Schema(
       required: true,
     },
 
+    // Single level — applies to all targets
+    level: {
+      type: String,
+      required: true,
+    },
+
+    // Multiple faculty/department targets
+    // e.g. [{ faculty: "Engineering", department: "Computer Science" }]
+    targets: [
+      {
+        faculty: { type: String, required: true },
+        department: { type: String, required: true },
+      }
+    ],
+
+    // Keep single faculty/department for backward compatibility
+    // and for lecturer-scoped filtering
     faculty: String,
-
     department: String,
-
-    level: String,
 
     host: {
       type: mongoose.Schema.Types.ObjectId,

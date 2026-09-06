@@ -6,9 +6,14 @@ const express = require('express');
 const dotenv = require('dotenv');
 const mongoose = require('mongoose');
 const cors = require('cors');
+const jwt = require('jsonwebtoken');
 
 const http = require('http');
 const { Server } = require('socket.io');
+
+const auth = require('./middleware/auth');
+const authorizeRole = require('./middleware/authorizeRole');
+const User = require('./models/user');
 
 
 // ================= CONFIG =================
@@ -17,7 +22,12 @@ dotenv.config();
 
 const app = express();
 
-app.use(cors());
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
 app.use(express.json());
 
 
@@ -51,10 +61,44 @@ app.use('/api/academic', academicRoutes);
 const departmentRoutes = require('./routes/departmentRoutes');
 app.use('/api/departments', departmentRoutes);
 
+// faculty
+const facultyRoutes = require('./routes/facultyRoutes');
+app.use('/api/faculties', facultyRoutes);
+
 // rooms
 const roomRoutes = require('./routes/roomRoutes');
 app.use('/api/rooms', roomRoutes);
 
+// courses
+const courseRoutes = require('./routes/courseRoutes');
+app.use('/api/courses', courseRoutes);
+
+// lessons
+const lessonRoutes = require('./routes/lessonRoutes');
+app.use('/api/lessons', lessonRoutes);
+
+const codeRoutes = require('./routes/codeRoutes');
+app.use('/api/code', codeRoutes);
+
+// quiz
+const quizRoutes = require('./routes/quizRoutes');
+app.use('/api/quiz', quizRoutes);
+
+// timetable
+const timetableRoutes = require('./routes/timetableRoutes');
+app.use('/api/timetable', timetableRoutes);
+
+// personal events
+const personalEventRoutes = require('./routes/personalEventRoutes');
+app.use('/api/personal-events', personalEventRoutes);
+
+// notifications
+const notificationRoutes = require('./routes/notificationRoutes');
+app.use('/api/notifications', notificationRoutes);
+
+// showcase
+const showcaseRoutes = require('./routes/showcaseRoutes');
+app.use('/api/showcase', showcaseRoutes);
 
 // ================= DEFAULT =================
 
@@ -89,6 +133,41 @@ const io = new Server(server, {
 app.set("io", io);
 
 
+// ================= SOCKET AUTH =================
+// FIXED: previously, socket identity (role/faculty/department) came straight from
+// whatever the client sent in the "userOnline" event, with nothing verifying it —
+// meaning any raw socket client could claim role: "admin" and get joined into
+// role-gated rooms in joinRoom below. This middleware runs before any connection
+// is accepted, verifies the same JWT your REST API already issues, and looks the
+// user up in the DB so role/faculty/department are trustworthy from that point on.
+//
+// Matches middleware/auth.js exactly: jwt.verify(token, process.env.JWT_SECRET)
+// and decoded.id as the user's _id.
+io.use(async (socket, next) => {
+  try {
+    const token = socket.handshake.auth?.token;
+    if (!token) return next(new Error('Authentication required'));
+
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const user = await User.findById(decoded.id).select('name role faculty department level');
+    if (!user) return next(new Error('User not found'));
+
+    socket.userData = {
+      id: user._id,
+      name: user.name,
+      role: user.role,
+      faculty: user.faculty,
+      department: user.department,
+      level: user.level,
+    };
+
+    next();
+  } catch (err) {
+    next(new Error('Authentication failed'));
+  }
+});
+
+
 // ================= ONLINE USERS =================
 
 let onlineUsers = [];
@@ -98,7 +177,7 @@ let onlineUsers = [];
 
 io.on("connection", (socket) => {
 
-  console.log("🟢 Connected:", socket.id);
+  console.log("🟢 Connected:", socket.id, "as", socket.userData?.name);
 
 
 // ================= JOIN ROOM =================
@@ -107,23 +186,62 @@ io.on("connection", (socket) => {
 
     const user = socket.userData;
 
-    // If we don't know who this socket belongs to yet, refuse
     if (!user) {
       console.log("Blocked joinRoom: no user identity on socket");
       return;
     }
 
-    // Admins can join any room
+    // Super admin — global, bulletin, resources only
     if (user.role === "admin") {
+      const isAllowed =
+        room === "global" ||
+        room.endsWith("_bulletin") ||
+        room.endsWith("_resources");
+      if (isAllowed) {
+        socket.join(room);
+        console.log("Joined room:", room);
+      } else {
+        console.log("Blocked joinRoom: admin tried to join private room", room);
+      }
+      return;
+    }
+
+    // Global room — everyone can join
+    if (room === "global") {
       socket.join(room);
       console.log("Joined room:", room);
       return;
     }
 
-    // Global room — everyone can join (read only enforced on backend)
-    if (room === "global") {
-      socket.join(room);
-      console.log("Joined room:", room);
+    // Faculty bulletin — lecturers, faculty_admin, students of same faculty
+    if (room.endsWith("_bulletin")) {
+      const faculty = room.replace("_bulletin", "");
+      if (user.faculty === faculty) {
+        socket.join(room);
+        console.log("Joined room:", room);
+      } else {
+        console.log("Blocked joinRoom: wrong faculty for bulletin", room);
+      }
+      return;
+    }
+
+    // Department admin — lecturer rooms + resources in their department
+    if (user.role === "department_admin") {
+      const allowedRooms = [
+        "lecturers_global",
+        `${user.faculty}_lecturer`,
+        `${user.faculty}_${user.department}_lecturer`,
+      ];
+      const isResourcesRoom =
+        room.startsWith(`${user.faculty}_${user.department}`) &&
+        room.endsWith("_resources");
+
+      if (allowedRooms.includes(room) || isResourcesRoom) {
+        socket.join(room);
+        console.log("Joined room:", room);
+      } else {
+        console.log("Blocked joinRoom: department_admin tried to join", room);
+      }
       return;
     }
 
@@ -134,7 +252,6 @@ io.on("connection", (socket) => {
         `${user.faculty}_lecturer`,
         `${user.faculty}_${user.department}_lecturer`,
       ];
-      // Also allow resources rooms in their faculty+department
       const isResourcesRoom =
         room.startsWith(`${user.faculty}_${user.department}`) &&
         room.endsWith("_resources");
@@ -166,20 +283,22 @@ io.on("connection", (socket) => {
 
   });
 
+  // ================= LEAVE ROOM =================
+
+  socket.on("leaveRoom", (room) => {
+    socket.leave(room);
+    console.log("Left room:", room);
+  });
+
 
 // ================= USER ONLINE =================
 
-  socket.on("userOnline", (user) => {
-
-    // Save the user's identity directly on this socket connection
-    // so we can verify room access later (e.g. in joinRoom)
-    socket.userData = {
-      name: user.name,
-      role: user.role,
-      faculty: user.faculty,
-      department: user.department,
-      level: user.level,
-    };
+  socket.on("userOnline", () => {
+    // FIXED: identity now comes from the verified socket.userData set during the
+    // io.use() auth handshake above, not from a client-supplied payload — a raw
+    // socket client can no longer announce itself as any name/role it wants.
+    const user = socket.userData;
+    if (!user) return;
 
     onlineUsers.push({
       id: socket.id,
@@ -221,6 +340,24 @@ io.on("connection", (socket) => {
       candidate,
     });
 
+  });
+
+  // ================= JOIN LIVE ROOM =================
+
+  socket.on("joinLiveRoom", ({ room, liveId, token }) => {
+    // Anyone joining a live room gets added to it
+    // Access control was already verified by joinLive REST endpoint
+    socket.join(room);
+    console.log("📡 Joined live room:", room);
+  });
+
+  // ================= LIVE ROOM JOINED (notify others) =================
+
+  socket.on("liveRoomJoined", ({ room, user }) => {
+    // Tell everyone else in the room that someone joined
+    // This triggers the lecturer to send an offer to the new student
+    socket.to(room).emit("studentJoined", { user });
+    console.log("👤 User joined live room:", user?.name);
   });
 
 

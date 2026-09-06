@@ -21,7 +21,7 @@ const userSchema = new mongoose.Schema(
     },
     role: {
       type: String,
-      enum: ['student', 'lecturer', 'admin'],
+      enum: ['student', 'lecturer', 'department_admin', 'faculty_admin', 'admin'],
       default: 'student',
     },
     faculty: {
@@ -58,7 +58,46 @@ const userSchema = new mongoose.Schema(
       type: String,
       default: '#16a34a',
     },
+    // Student registration number
+    regNumber: {
+      type: String,
+      default: null,
+    },
+
+    // Lecturer staff ID
+    staffId: {
+      type: String,
+      default: null,
+    },
+
+    // Date of birth
+    dateOfBirth: {
+      type: Date,
+      default: null,
+    },
+
+    // Phone number
+    phone: {
+      type: String,
+      default: null,
+    },
     firstLogin: {
+      type: Boolean,
+      default: true,
+    },
+    notifLive: {
+      type: Boolean,
+      default: true,
+    },
+    notifAnnouncement: {
+      type: Boolean,
+      default: true,
+    },
+    notifLesson: {
+      type: Boolean,
+      default: true,
+    },
+    notifQuiz: {
       type: Boolean,
       default: true,
     },

@@ -29,6 +29,30 @@ const announcementSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
     },
+    // Priority level
+    priority: {
+      type: String,
+      enum: ['urgent', 'important', 'general'],
+      default: 'general',
+    },
+    // Deletion audit trail
+    deletedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null,
+    },
+    deletedAt: {
+      type: Date,
+      default: null,
+    },
+    deletedByName: {
+      type: String,
+      default: null,
+    },
+    deletedByRole: {
+      type: String,
+      default: null,
+    },
   },
   { timestamps: true }
 );

@@ -9,19 +9,41 @@ exports.getRooms = async (req, res) => {
     let rooms = [];
 
     if (user.role === 'admin') {
-      // Admin sees ALL rooms
-      rooms = await Room.find().sort({ type: 1, name: 1 });
-
-    } else if (user.role === 'lecturer') {
-      // Lecturer sees:
-      // 1. All lecturers global room
-      // 2. Their faculty lecturer room
-      // 3. Their department lecturer room
-      // 4. Resources rooms for their faculty (to post study materials)
-      // NOTE: students never see these lecturer rooms
+      // Super admin sees global + resources rooms only
+      // (no student general, no lecturer rooms — privacy)
       rooms = await Room.find({
         $or: [
           { type: 'global' },
+          { type: 'student', subType: 'resources' },
+          { type: 'bulletin' },
+        ],
+      });
+
+    } else if (user.role === 'faculty_admin') {
+      // Faculty admin sees ALL resources rooms across ALL departments in their faculty
+      // (not limited to just their registered department)
+      rooms = await Room.find({
+        $or: [
+          { type: 'global' },
+          { type: 'bulletin', faculty: user.faculty },
+          { name: 'lecturers_global' },
+          { type: 'lecturer', subType: 'faculty', faculty: user.faculty },
+          { type: 'lecturer', subType: 'department', faculty: user.faculty },
+          // ALL resources rooms in their faculty — across all departments and levels
+          { type: 'student', subType: 'resources', faculty: user.faculty },
+        ],
+      });
+
+    } else if (user.role === 'department_admin') {
+      // Department admin sees:
+      // - global (read only)
+      // - faculty bulletin (read only)
+      // - lecturer rooms in their faculty/department
+      // - ALL resources rooms in their department
+      rooms = await Room.find({
+        $or: [
+          { type: 'global' },
+          { type: 'bulletin', faculty: user.faculty },
           { name: 'lecturers_global' },
           { type: 'lecturer', subType: 'faculty', faculty: user.faculty },
           { type: 'lecturer', subType: 'department', faculty: user.faculty, department: user.department },
@@ -31,13 +53,14 @@ exports.getRooms = async (req, res) => {
 
     } else if (user.role === 'student') {
       // Student sees:
-      // 1. Global room (read only)
-      // 2. Their class general room (can post)
-      // 3. Their class resources room (read only)
-      // NOTE: students NEVER see lecturer rooms
+      // - global (read only)
+      // - faculty bulletin for their faculty (read only)
+      // - their class general room (can post)
+      // - their class resources room (read only)
       rooms = await Room.find({
         $or: [
           { type: 'global' },
+          { type: 'bulletin', faculty: user.faculty },
           {
             type: 'student',
             faculty: user.faculty,

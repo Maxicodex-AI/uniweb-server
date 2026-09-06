@@ -8,9 +8,9 @@ const roomSchema = new mongoose.Schema({
     unique: true,
   },
 
-  type: {
+ type: {
     type: String,
-    enum: ['global', 'lecturer', 'student'],
+    enum: ['global', 'lecturer', 'student', 'bulletin'],
     required: true,
   },
 

@@ -13,14 +13,12 @@ const chatSchema = new mongoose.Schema(
       required: true,
     },
 
-    // Link message to a specific room
     roomId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Room',
       required: true,
     },
 
-    // Keep these for quick filtering without joining
     faculty: String,
     department: String,
     level: String,
@@ -32,17 +30,31 @@ const chatSchema = new mongoose.Schema(
       default: 'student',
     },
 
-    // Reactions — array of { userId, emoji }
+    // Edit tracking
+    edited: {
+      type: Boolean,
+      default: false,
+    },
+    editedAt: {
+      type: Date,
+      default: null,
+    },
+    originalMessage: {
+      type: String,
+      default: null,
+    },
+
+    // Deleted for everyone (sender deletes)
+    deletedForAll: {
+      type: Boolean,
+      default: false,
+    },
+
+    // Reactions
     reactions: [
       {
-        userId: {
-          type: mongoose.Schema.Types.ObjectId,
-          ref: 'User',
-        },
-        emoji: {
-          type: String,
-          enum: ['👍', '❤️', '😂', '😮', '🙏'],
-        },
+        userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+        emoji: { type: String, enum: ['👍', '❤️', '😂', '😮', '🙏'] },
       },
     ],
   },

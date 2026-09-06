@@ -1,6 +1,6 @@
 const Room = require('../models/Room');
 
-// ===== GLOBAL ROOM (everyone reads, admin posts) =====
+// ===== GLOBAL ROOM (everyone reads, super admin posts) =====
 async function ensureGlobalRoom() {
   const exists = await Room.findOne({ name: 'global' });
   if (exists) return exists;
@@ -10,7 +10,20 @@ async function ensureGlobalRoom() {
   });
 }
 
-// ===== ALL LECTURERS ROOM (every lecturer in university) =====
+// ===== FACULTY BULLETIN ROOM (faculty admin posts, all faculty reads) =====
+async function ensureFacultyBulletinRoom(faculty) {
+  const roomName = `${faculty}_bulletin`;
+  const exists = await Room.findOne({ name: roomName });
+  if (exists) return exists;
+  return Room.create({
+    name: roomName,
+    type: 'bulletin',
+    subType: 'faculty',
+    faculty,
+  });
+}
+
+// ===== ALL LECTURERS ROOM =====
 async function ensureLecturersGlobalRoom() {
   const exists = await Room.findOne({ name: 'lecturers_global' });
   if (exists) return exists;
@@ -79,6 +92,7 @@ async function ensureStudentRooms(faculty, department, level) {
 
 module.exports = {
   ensureGlobalRoom,
+  ensureFacultyBulletinRoom,
   ensureLecturersGlobalRoom,
   ensureLecturerRoom,
   ensureDepartmentLecturerRoom,
