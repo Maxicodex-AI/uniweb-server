@@ -106,6 +106,33 @@ app.get('/', (req, res) => {
   res.send('✅ UniLearn Server is running...');
 });
 
+// TEMPORARY SEED ROUTE — DELETE AFTER USE
+app.get('/api/seed-admin', async (req, res) => {
+  try {
+    const bcrypt = require('bcryptjs');
+    const User = require('./models/user');
+
+    const existing = await User.findOne({ email: 'admin@uniweb.com' });
+    if (existing) return res.json({ message: 'Admin already exists', email: 'admin@uniweb.com' });
+
+    const salt = await bcrypt.genSalt(10);
+    const password = await bcrypt.hash('Admin@2024', salt);
+
+    const admin = await User.create({
+      name: 'Super Admin',
+      email: 'admin@uniweb.com',
+      password,
+      role: 'admin',
+      faculty: 'Administration',
+      department: 'Administration',
+      avatarColor: '#dc2626',
+    });
+
+    res.json({ message: 'Admin created!', email: 'admin@uniweb.com', password: 'Admin@2024' });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
 
 // ================= MONGODB =================
 
