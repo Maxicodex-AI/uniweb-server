@@ -44,10 +44,14 @@ const chatSchema = new mongoose.Schema(
       default: null,
     },
 
-    // Deleted for everyone (sender deletes)
+        // Deleted for everyone (sender deletes)
     deletedForAll: {
       type: Boolean,
       default: false,
+    },
+    deletedAt: {
+      type: Date,
+      default: null,
     },
 
     // Reactions

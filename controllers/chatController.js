@@ -338,13 +338,17 @@ exports.deleteMessageForAll = async (req, res) => {
       return res.status(404).json({ message: 'Message not found' });
     }
 
-    // Only sender can delete for everyone
-    if (chat.sender.toString() !== user._id.toString()) {
+    // Allow message sender OR any admin role to delete for everyone
+    const isOwner = chat.sender.toString() === user._id.toString();
+    const isAdmin = ['admin', 'faculty_admin', 'department_admin'].includes(user.role);
+
+    if (!isOwner && !isAdmin) {
       return res.status(403).json({ message: 'You can only delete your own messages for everyone' });
     }
 
     // Mark as deleted for all
     chat.deletedForAll = true;
+    chat.deletedAt = new Date();
     chat.message = 'This message was deleted';
     await chat.save();
 
