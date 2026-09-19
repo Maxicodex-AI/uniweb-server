@@ -101,6 +101,9 @@ app.use('/api/notifications', notificationRoutes);
 const showcaseRoutes = require('./routes/showcaseRoutes');
 app.use('/api/showcase', showcaseRoutes);
 
+const aiRoutes = require('./routes/aiRoutes');
+app.use('/api/ai', aiRoutes);
+
 // ================= DEFAULT =================
 
 app.get('/', (req, res) => {
