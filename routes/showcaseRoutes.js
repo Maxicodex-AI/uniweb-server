@@ -4,56 +4,124 @@ const auth = require('../middleware/auth');
 const authorizeRole = require('../middleware/authorizeRole');
 const ShowcasePost = require('../models/ShowcasePost');
 
-// ===== Helper: extract YouTube embed URL =====
+// ===== Helpers =====
 function getEmbedUrl(url) {
-  // YouTube watch URL
   const ytMatch = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/)([^&\n?#]+)/);
-  if (ytMatch) {
-    return `https://www.youtube.com/embed/${ytMatch[1]}?autoplay=1&mute=1&loop=1&playlist=${ytMatch[1]}&controls=0&showinfo=0&rel=0`;
-  }
-  // YouTube short URL
+  if (ytMatch) return `https://www.youtube.com/embed/${ytMatch[1]}?autoplay=1&mute=1&loop=1&playlist=${ytMatch[1]}&controls=0&showinfo=0&rel=0`;
   const ytShort = url.match(/youtube\.com\/shorts\/([^&\n?#]+)/);
-  if (ytShort) {
-    return `https://www.youtube.com/embed/${ytShort[1]}?autoplay=1&mute=1&loop=1&playlist=${ytShort[1]}&controls=0`;
-  }
-  // Vimeo
-  const vimeoMatch = url.match(/vimeo\.com\/(\d+)/);
-  if (vimeoMatch) {
-    return `https://player.vimeo.com/video/${vimeoMatch[1]}?autoplay=1&muted=1&loop=1&background=1`;
-  }
-  // Return as-is for direct MP4 — NOTE: the frontend currently puts this straight into an
-  // <iframe src>, which does not render a proper inline player for raw video files. If you
-  // start posting direct MP4 links, the ShowcaseSection component needs a <video> fallback
-  // for posts whose embedUrl isn't a youtube.com/vimeo.com URL.
+  if (ytShort) return `https://www.youtube.com/embed/${ytShort[1]}?autoplay=1&mute=1&loop=1&playlist=${ytShort[1]}&controls=0`;
+  const vimeo = url.match(/vimeo\.com\/(\d+)/);
+  if (vimeo) return `https://player.vimeo.com/video/${vimeo[1]}?autoplay=1&muted=1&loop=1&background=1`;
   return url;
 }
 
-// ===== Helper: extract YouTube thumbnail =====
 function getThumbnail(url) {
-  // hqdefault is generated for virtually every YouTube video; maxresdefault is not
-  // (older/low-res uploads often lack it and 404).
   const ytMatch = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/)([^&\n?#]+)/);
-  if (ytMatch) {
-    return `https://img.youtube.com/vi/${ytMatch[1]}/hqdefault.jpg`;
-  }
+  if (ytMatch) return `https://img.youtube.com/vi/${ytMatch[1]}/maxresdefault.jpg`;
   const ytShort = url.match(/youtube\.com\/shorts\/([^&\n?#]+)/);
-  if (ytShort) {
-    return `https://img.youtube.com/vi/${ytShort[1]}/hqdefault.jpg`;
-  }
+  if (ytShort) return `https://img.youtube.com/vi/${ytShort[1]}/maxresdefault.jpg`;
   return null;
 }
 
-// ===== GET ALL (public — no auth needed) =====
+// ===== GET ALL FEATURED (public — for main showcase) =====
 router.get('/', async (req, res) => {
   try {
     const { faculty, tag } = req.query;
-    let filter = { isPublished: true };
+    let filter = { isPublished: true, isFeatured: true };
     if (faculty) filter.faculty = faculty;
     if (tag) filter.tag = tag;
-
     const posts = await ShowcasePost.find(filter)
       .sort({ isPinned: -1, createdAt: -1 })
       .limit(20);
+    res.json(posts);
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ===== GET ALL FACULTIES WITH POST COUNTS (public) =====
+router.get('/faculties', async (req, res) => {
+  try {
+    const Faculty = require('../models/Faculty');
+    const faculties = await Faculty.find({ isActive: true }).sort({ name: 1 });
+
+    const facultiesWithCounts = await Promise.all(
+      faculties.map(async (faculty) => {
+        const postCount = await ShowcasePost.countDocuments({
+          faculty: faculty.name,
+          isPublished: true,
+        });
+
+        const Department = require('../models/Department');
+        const departments = await Department.find({ faculty: faculty.name });
+
+        const deptsWithCounts = await Promise.all(
+          departments.map(async (dept) => {
+            const deptPostCount = await ShowcasePost.countDocuments({
+              faculty: faculty.name,
+              department: dept.name,
+              isPublished: true,
+            });
+            const latestPost = await ShowcasePost.findOne({
+              faculty: faculty.name,
+              department: dept.name,
+              isPublished: true,
+            }).sort({ createdAt: -1 });
+            return {
+              _id: dept._id,
+              name: dept.name,
+              description: dept.description,
+              learningType: dept.learningType,
+              postCount: deptPostCount,
+              latestThumbnail: latestPost?.thumbnail || null,
+            };
+          })
+        );
+
+        return {
+          _id: faculty._id,
+          name: faculty.name,
+          description: faculty.description,
+          postCount,
+          departments: deptsWithCounts,
+        };
+      })
+    );
+
+    res.json(facultiesWithCounts);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ===== GET POSTS BY FACULTY (public) =====
+router.get('/faculty/:facultyName', async (req, res) => {
+  try {
+    const posts = await ShowcasePost.find({
+      faculty: decodeURIComponent(req.params.facultyName),
+      isPublished: true,
+    }).sort({ createdAt: -1 }).limit(20);
+    res.json(posts);
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ===== GET POSTS BY DEPARTMENT (public) =====
+router.get('/department/:facultyName/:deptName', async (req, res) => {
+  try {
+    const posts = await ShowcasePost.find({
+      faculty: decodeURIComponent(req.params.facultyName),
+      department: decodeURIComponent(req.params.deptName),
+      isPublished: true,
+    }).sort({ createdAt: -1 });
+
+    // Increment views
+    await ShowcasePost.updateMany({
+      faculty: decodeURIComponent(req.params.facultyName),
+      department: decodeURIComponent(req.params.deptName),
+    }, { $inc: { views: 1 } });
 
     res.json(posts);
   } catch (err) {
@@ -61,46 +129,49 @@ router.get('/', async (req, res) => {
   }
 });
 
-// ===== GET SINGLE (public) =====
-// NOTE: this is the only route that increments `views`. The frontend showcase grid
-// currently never calls this endpoint (it only fetches the list), so view counts
-// will stay frozen unless/until the frontend fires a request here when a card is
-// actually opened/played.
+// ===== GET SINGLE POST (public) =====
 router.get('/:id', async (req, res) => {
   try {
     const post = await ShowcasePost.findById(req.params.id);
     if (!post) return res.status(404).json({ message: 'Post not found' });
-
-    // Increment views
     post.views += 1;
     await post.save();
-
     res.json(post);
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
   }
 });
 
-// ===== CREATE (admin, faculty_admin, department_admin) =====
+// ===== CREATE POST =====
 router.post('/', auth, authorizeRole('admin', 'faculty_admin', 'department_admin'), async (req, res) => {
   try {
-    const { title, description, videoUrl, faculty, department, tag } = req.body;
+    const { title, description, videoUrl, faculty, department, tag, isFeatured } = req.body;
+    const user = req.user;
+
+    // Scope check
+    if (user.role === 'faculty_admin' && faculty !== user.faculty) {
+      return res.status(403).json({ message: 'You can only post to your own faculty' });
+    }
+    if (user.role === 'department_admin') {
+      if (faculty !== user.faculty || department !== user.department) {
+        return res.status(403).json({ message: 'You can only post to your own department' });
+      }
+    }
 
     const embedUrl = getEmbedUrl(videoUrl);
     const thumbnail = getThumbnail(videoUrl);
 
     const post = await ShowcasePost.create({
-      title,
-      description,
-      videoUrl,
-      embedUrl,
-      thumbnail,
-      faculty,
-      department,
+      title, description, videoUrl, embedUrl, thumbnail,
+      faculty: faculty || user.faculty,
+      department: department || (user.role === 'department_admin' ? user.department : null),
+      learningType: req.body.learningType || null,
       tag,
-      postedBy: req.user._id,
-      postedByName: req.user.name,
+      postedBy: user._id,
+      postedByName: user.name,
+      postedByRole: user.role,
       isPublished: true,
+      isFeatured: user.role === 'admin' ? (isFeatured || false) : false,
     });
 
     res.status(201).json(post);
@@ -110,26 +181,22 @@ router.post('/', auth, authorizeRole('admin', 'faculty_admin', 'department_admin
   }
 });
 
-// ===== UPDATE (admin, faculty_admin, department_admin) =====
-router.put('/:id', auth, authorizeRole('admin', 'faculty_admin', 'department_admin'), async (req, res) => {
+// ===== DELETE =====
+router.delete('/:id', auth, authorizeRole('admin', 'faculty_admin', 'department_admin'), async (req, res) => {
   try {
-    const post = await ShowcasePost.findByIdAndUpdate(req.params.id, req.body, { new: true });
+    const post = await ShowcasePost.findById(req.params.id);
     if (!post) return res.status(404).json({ message: 'Post not found' });
-    res.json(post);
-  } catch (err) {
-    res.status(500).json({ message: 'Server error' });
-  }
-});
 
-// ===== DELETE (admin only) =====
-// Tightened to match the comment/UI: your AdminPage's Showcase tab (the only place
-// delete is currently exposed) is gated to role === 'admin', so faculty_admin never
-// used this in practice. If you want faculty_admin to delete their own posts too,
-// add it back explicitly rather than leaving it implicit.
-router.delete('/:id', auth, authorizeRole('admin'), async (req, res) => {
-  try {
+    // Scope check
+    if (req.user.role === 'faculty_admin' && post.faculty !== req.user.faculty) {
+      return res.status(403).json({ message: 'Not authorized' });
+    }
+    if (req.user.role === 'department_admin' && post.department !== req.user.department) {
+      return res.status(403).json({ message: 'Not authorized' });
+    }
+
     await ShowcasePost.findByIdAndDelete(req.params.id);
-    res.json({ message: 'Post deleted' });
+    res.json({ message: 'Deleted' });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
   }
@@ -139,8 +206,21 @@ router.delete('/:id', auth, authorizeRole('admin'), async (req, res) => {
 router.put('/:id/pin', auth, authorizeRole('admin'), async (req, res) => {
   try {
     const post = await ShowcasePost.findById(req.params.id);
-    if (!post) return res.status(404).json({ message: 'Post not found' });
+    if (!post) return res.status(404).json({ message: 'Not found' });
     post.isPinned = !post.isPinned;
+    await post.save();
+    res.json(post);
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ===== FEATURE/UNFEATURE (admin only) =====
+router.put('/:id/feature', auth, authorizeRole('admin'), async (req, res) => {
+  try {
+    const post = await ShowcasePost.findById(req.params.id);
+    if (!post) return res.status(404).json({ message: 'Not found' });
+    post.isFeatured = !post.isFeatured;
     await post.save();
     res.json(post);
   } catch (err) {
