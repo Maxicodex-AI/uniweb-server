@@ -95,11 +95,29 @@ router.get('/faculties', async (req, res) => {
   }
 });
 
-// ===== GET POSTS BY FACULTY (public) =====
+// ===== GET ALL POSTS BY FACULTY (public) =====
+// Returns every post in the faculty (faculty-level AND department-level).
+// Used by the Faculty Admin panel so admins can see and delete everything.
 router.get('/faculty/:facultyName', async (req, res) => {
   try {
     const posts = await ShowcasePost.find({
       faculty: decodeURIComponent(req.params.facultyName),
+      isPublished: true,
+    }).sort({ createdAt: -1 }).limit(20);
+    res.json(posts);
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ===== GET FACULTY-LEVEL POSTS ONLY (public) =====
+// NEW: posts made at faculty level (no department). Used by the homepage
+// when a visitor clicks a faculty.
+router.get('/faculty-level/:facultyName', async (req, res) => {
+  try {
+    const posts = await ShowcasePost.find({
+      faculty: decodeURIComponent(req.params.facultyName),
+      department: null, // matches posts where department is null or missing
       isPublished: true,
     }).sort({ createdAt: -1 }).limit(20);
     res.json(posts);
@@ -148,12 +166,30 @@ router.post('/', auth, authorizeRole('admin', 'faculty_admin', 'department_admin
     const { title, description, videoUrl, faculty, department, tag, isFeatured } = req.body;
     const user = req.user;
 
-    // Scope check
-    if (user.role === 'faculty_admin' && faculty !== user.faculty) {
+    if (!title || !videoUrl) {
+      return res.status(400).json({ message: 'Title and video URL are required' });
+    }
+
+    // Scope check for faculty_admin (faculty is optional; falls back to their own)
+    if (user.role === 'faculty_admin' && faculty && faculty !== user.faculty) {
       return res.status(403).json({ message: 'You can only post to your own faculty' });
     }
+
+    // Faculty admin may pick a department, but it must belong to their faculty
+    if (user.role === 'faculty_admin' && department) {
+      const Department = require('../models/Department');
+      const deptInFaculty = await Department.findOne({ name: department, faculty: user.faculty });
+      if (!deptInFaculty) {
+        return res.status(400).json({ message: 'That department is not in your faculty' });
+      }
+    }
+
+    // Scope check for department_admin
     if (user.role === 'department_admin') {
-      if (faculty !== user.faculty || department !== user.department) {
+      if (faculty && faculty !== user.faculty) {
+        return res.status(403).json({ message: 'You can only post to your own faculty' });
+      }
+      if (department && department !== user.department) {
         return res.status(403).json({ message: 'You can only post to your own department' });
       }
     }
@@ -161,9 +197,20 @@ router.post('/', auth, authorizeRole('admin', 'faculty_admin', 'department_admin
     const embedUrl = getEmbedUrl(videoUrl);
     const thumbnail = getThumbnail(videoUrl);
 
+    // Featured (main homepage showcase) is for super admin only.
+    // Super admin with no faculty = featured automatically.
+    let shouldFeature = false;
+    if (user.role === 'admin') {
+      shouldFeature = !faculty ? true : (isFeatured || false);
+    }
+
     const post = await ShowcasePost.create({
-      title, description, videoUrl, embedUrl, thumbnail,
-      faculty: faculty || user.faculty,
+      title,
+      description,
+      videoUrl,
+      embedUrl,
+      thumbnail,
+      faculty: faculty || (user.role !== 'admin' ? user.faculty : null),
       department: department || (user.role === 'department_admin' ? user.department : null),
       learningType: req.body.learningType || null,
       tag,
@@ -171,13 +218,13 @@ router.post('/', auth, authorizeRole('admin', 'faculty_admin', 'department_admin
       postedByName: user.name,
       postedByRole: user.role,
       isPublished: true,
-      isFeatured: user.role === 'admin' ? (isFeatured || false) : false,
+      isFeatured: shouldFeature,
     });
 
     res.status(201).json(post);
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Server error' });
+    console.error('Showcase post error:', err);
+    res.status(500).json({ message: err.message || 'Server error' });
   }
 });
 

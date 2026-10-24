@@ -9,7 +9,13 @@ const showcasePostSchema = new mongoose.Schema(
     thumbnail: { type: String },
 
     // Scope
-    faculty: { type: String, required: true },
+    // Required for faculty/department posts. A featured post (super admin
+    // posting to the main showcase) may have no faculty.
+    faculty: {
+      type: String,
+      default: null,
+      required: function () { return !this.isFeatured; },
+    },
     department: { type: String, default: null }, // null = faculty-level post
     learningType: { type: String },
 
