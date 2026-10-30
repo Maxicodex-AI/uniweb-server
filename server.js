@@ -14,6 +14,7 @@ const { Server } = require('socket.io');
 const auth = require('./middleware/auth');
 const authorizeRole = require('./middleware/authorizeRole');
 const User = require('./models/user');
+const Driver = require('./models/Driver'); // NOTE: filename case must match exactly on Linux hosts
 const { cleanupDeletedMessages } = require('./utils/cleanupHelper');
 
 
@@ -101,6 +102,10 @@ app.use('/api/notifications', notificationRoutes);
 const showcaseRoutes = require('./routes/showcaseRoutes');
 app.use('/api/showcase', showcaseRoutes);
 
+// drivers
+const driverRoutes = require('./routes/driverRoutes');
+app.use('/api/drivers', driverRoutes);
+
 const aiRoutes = require('./routes/aiRoutes');
 app.use('/api/ai', aiRoutes);
 
@@ -148,7 +153,7 @@ mongoose
   .then(() => console.log('✅ MongoDB connected successfully'))
   .catch((err) => console.log('❌ MongoDB connection error:', err));
 
-  // Run message cleanup every hour
+// Run message cleanup every hour
 setInterval(cleanupDeletedMessages, 60 * 60 * 1000);
 
 
@@ -168,38 +173,63 @@ app.set("io", io);
 
 
 // ================= SOCKET AUTH =================
-// FIXED: previously, socket identity (role/faculty/department) came straight from
-// whatever the client sent in the "userOnline" event, with nothing verifying it —
-// meaning any raw socket client could claim role: "admin" and get joined into
-// role-gated rooms in joinRoom below. This middleware runs before any connection
-// is accepted, verifies the same JWT your REST API already issues, and looks the
-// user up in the DB so role/faculty/department are trustworthy from that point on.
-//
-// Matches middleware/auth.js exactly: jwt.verify(token, process.env.JWT_SECRET)
-// and decoded.id as the user's _id.
+// Verifies the JWT sent in socket.handshake.auth.token before any connection
+// is accepted, then looks the identity up in the DB so role/faculty/department
+// are trustworthy. Supports both regular users (User collection) and
+// shuttle drivers (Driver collection).
 io.use(async (socket, next) => {
   try {
     const token = socket.handshake.auth?.token;
     if (!token) return next(new Error('Authentication required'));
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    // Regular user first
     const user = await User.findById(decoded.id).select('name role faculty department level');
-    if (!user) return next(new Error('User not found'));
+    if (user) {
+      socket.userData = {
+        id: user._id,
+        name: user.name,
+        role: user.role,
+        faculty: user.faculty,
+        department: user.department,
+        level: user.level,
+      };
+      return next();
+    }
 
-    socket.userData = {
-      id: user._id,
-      name: user.name,
-      role: user.role,
-      faculty: user.faculty,
-      department: user.department,
-      level: user.level,
-    };
+    // Otherwise, a driver
+    const driver = await Driver.findById(decoded.id).select('name');
+    if (driver) {
+      socket.userData = {
+        id: driver._id,
+        name: driver.name,
+        role: 'driver',
+      };
+      return next();
+    }
 
-    next();
+    return next(new Error('User not found'));
   } catch (err) {
     next(new Error('Authentication failed'));
   }
 });
+
+
+// ================= HELPERS =================
+
+// Marks a driver offline and tells all clients. Safe to call more than once.
+async function setDriverOffline(driverId) {
+  try {
+    await Driver.findByIdAndUpdate(driverId, {
+      isOnShift: false,
+      status: 'offline',
+    });
+    io.emit('driverOffline', { driverId: String(driverId) });
+  } catch (err) {
+    console.error('Driver offline error:', err.message);
+  }
+}
 
 
 // ================= ONLINE USERS =================
@@ -328,9 +358,6 @@ io.on("connection", (socket) => {
 // ================= USER ONLINE =================
 
   socket.on("userOnline", () => {
-    // FIXED: identity now comes from the verified socket.userData set during the
-    // io.use() auth handshake above, not from a client-supplied payload — a raw
-    // socket client can no longer announce itself as any name/role it wants.
     const user = socket.userData;
     if (!user) return;
 
@@ -341,6 +368,55 @@ io.on("connection", (socket) => {
     });
 
     io.emit("onlineUsers", onlineUsers);
+  });
+
+
+  // ================= DRIVER LOCATION TRACKING =================
+  // Identity comes from the verified socket.userData (set in io.use above),
+  // so the client cannot update another driver's record by sending a
+  // different driverId. Any driverId/token fields sent by the client are ignored.
+
+  socket.on('driverLocation', async (data) => {
+    try {
+      const user = socket.userData;
+      if (!user || user.role !== 'driver') return;
+
+      const { lat, lng, availableSeats, status } = data || {};
+
+      if (typeof lat !== 'number' || typeof lng !== 'number') return;
+      if (availableSeats !== undefined && typeof availableSeats !== 'number') return;
+
+      const driverId = String(user.id);
+      const updatedAt = new Date();
+
+      const update = {
+        currentLocation: { lat, lng, updatedAt },
+        isOnShift: true,
+      };
+      if (availableSeats !== undefined) update.availableSeats = availableSeats;
+      if (status) update.status = status;
+
+      await Driver.findByIdAndUpdate(driverId, update);
+
+      // Broadcast to all connected clients (students)
+      io.emit('driverLocationUpdate', {
+        driverId,
+        lat,
+        lng,
+        availableSeats,
+        status,
+        updatedAt,
+      });
+    } catch (err) {
+      console.error('Driver location error:', err.message);
+    }
+  });
+
+  // Driver ends shift manually
+  socket.on('driverDisconnect', async () => {
+    const user = socket.userData;
+    if (!user || user.role !== 'driver') return;
+    await setDriverOffline(user.id);
   });
 
 
@@ -397,13 +473,18 @@ io.on("connection", (socket) => {
 
   // ================= DISCONNECT =================
 
-  socket.on("disconnect", () => {
+  socket.on("disconnect", async () => {
 
     onlineUsers = onlineUsers.filter(
       u => u.id !== socket.id
     );
 
     io.emit("onlineUsers", onlineUsers);
+
+    // If a driver's connection drops, take them off shift
+    if (socket.userData?.role === 'driver') {
+      await setDriverOffline(socket.userData.id);
+    }
 
     console.log("🔴 Disconnected:", socket.id);
 
