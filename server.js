@@ -493,6 +493,45 @@ io.on("connection", (socket) => {
 });
 
 
+// ================= STALE DRIVER SWEEP =================
+// Marks drivers offline when their phone stops sending location for 5 minutes.
+// (The driver app should send a heartbeat every ~30s even when parked, so a
+// connected-but-stationary driver is not swept.)
+
+const STALE_MS = 5 * 60 * 1000;
+
+setInterval(async () => {
+  try {
+    const cutoff = new Date(Date.now() - STALE_MS);
+    const stale = await Driver.find({
+      isOnShift: true,
+      $or: [
+        { 'currentLocation.updatedAt': { $lt: cutoff } },
+        { 'currentLocation.updatedAt': null, updatedAt: { $lt: cutoff } },
+      ],
+    }).select('_id');
+
+    if (!stale.length) return;
+    const ids = stale.map(d => d._id);
+
+    await Driver.updateMany(
+      { _id: { $in: ids } },
+      {
+        isOnShift: false,
+        status: 'offline',
+        'currentLocation.lat': null,
+        'currentLocation.lng': null,
+        'currentLocation.updatedAt': null,
+      }
+    );
+
+    ids.forEach(id => io.emit('driverOffline', { driverId: String(id) }));
+  } catch (err) {
+    console.error('Driver sweep error:', err.message);
+  }
+}, 30 * 1000);
+
+
 // ================= START =================
 
 server.listen(PORT, () => {

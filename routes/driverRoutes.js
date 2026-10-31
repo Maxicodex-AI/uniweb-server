@@ -90,12 +90,18 @@ router.post('/login', async (req, res) => {
 });
 
 // ===== GET ALL ACTIVE DRIVERS (public — for students) =====
+// Only drivers on shift, not offline, with a real location sent in the last
+// 5 minutes. Fields are listed by name so phone and password are never sent.
+// NOTE: keep this above any '/:id' route, or "active" would be read as an id.
 router.get('/active', async (req, res) => {
   try {
+    const cutoff = new Date(Date.now() - 5 * 60 * 1000);
     const drivers = await Driver.find({
       isOnShift: true,
       status: { $ne: 'offline' },
-    }).select('-password');
+      'currentLocation.lat': { $ne: null },
+      'currentLocation.updatedAt': { $gte: cutoff },
+    }).select('name tricycleNumber totalSeats availableSeats status currentLocation');
     res.json(drivers);
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
