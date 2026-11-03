@@ -381,10 +381,21 @@ io.on("connection", (socket) => {
       const user = socket.userData;
       if (!user || user.role !== 'driver') return;
 
-      const { lat, lng, availableSeats, status } = data || {};
+      const { lat, lng, availableSeats } = data || {};
 
-      if (typeof lat !== 'number' || typeof lng !== 'number') return;
-      if (availableSeats !== undefined && typeof availableSeats !== 'number') return;
+      // Valid coordinates only
+      const validCoord =
+        Number.isFinite(lat) && Number.isFinite(lng) &&
+        Math.abs(lat) <= 90 && Math.abs(lng) <= 180;
+      if (!validCoord) return;
+
+      // Seats must be a sane whole number; status is derived here, never
+      // taken from the client (findByIdAndUpdate does not enforce the enum).
+      const seats =
+        Number.isInteger(availableSeats) && availableSeats >= 0 && availableSeats <= 20
+          ? availableSeats
+          : undefined;
+      const status = seats === 0 ? 'full' : 'active';
 
       const driverId = String(user.id);
       const updatedAt = new Date();
@@ -392,9 +403,9 @@ io.on("connection", (socket) => {
       const update = {
         currentLocation: { lat, lng, updatedAt },
         isOnShift: true,
+        status,
       };
-      if (availableSeats !== undefined) update.availableSeats = availableSeats;
-      if (status) update.status = status;
+      if (seats !== undefined) update.availableSeats = seats;
 
       await Driver.findByIdAndUpdate(driverId, update);
 
@@ -403,7 +414,7 @@ io.on("connection", (socket) => {
         driverId,
         lat,
         lng,
-        availableSeats,
+        availableSeats: seats,
         status,
         updatedAt,
       });
