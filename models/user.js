@@ -54,6 +54,16 @@ const userSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
+
+    // Fleet Head: the one lecturer the Super Admin appoints to run the TETFund
+    // tricycle fleet portal. The person keeps their lecturer role and normal
+    // UniWeb login; this flag only unlocks the fleet portal. Set and cleared
+    // by the Super Admin only. At most one user can hold it (see index below).
+    isFleetHead: {
+      type: Boolean,
+      default: false,
+    },
+
     avatarColor: {
       type: String,
       default: '#16a34a',
@@ -103,6 +113,12 @@ const userSchema = new mongoose.Schema(
     },
   },
   { timestamps: true }
+);
+
+// Only one Fleet Head at a time: the database itself refuses a second one.
+userSchema.index(
+  { isFleetHead: 1 },
+  { unique: true, partialFilterExpression: { isFleetHead: true } }
 );
 
 const User = mongoose.model('User', userSchema);

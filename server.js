@@ -15,6 +15,8 @@ const auth = require('./middleware/auth');
 const authorizeRole = require('./middleware/authorizeRole');
 const User = require('./models/user');
 const Driver = require('./models/Driver'); // NOTE: filename case must match exactly on Linux hosts
+const { lagosDay } = require('./utils/fleetTime');
+const { runFleetMigration } = require('./utils/fleetMigration');
 const { cleanupDeletedMessages } = require('./utils/cleanupHelper');
 
 
@@ -23,6 +25,10 @@ const { cleanupDeletedMessages } = require('./utils/cleanupHelper');
 dotenv.config();
 
 const app = express();
+
+// Behind Render/Railway/Nginx the real visitor address arrives in a header.
+// Needed for the per-IP rate limit on the public tricycle list.
+app.set('trust proxy', 1);
 
 app.use(cors({
   origin: process.env.FRONTEND_URL || 'http://localhost:3000',
@@ -106,6 +112,10 @@ app.use('/api/showcase', showcaseRoutes);
 const driverRoutes = require('./routes/driverRoutes');
 app.use('/api/drivers', driverRoutes);
 
+// fleet portal (Fleet Head and fleet admins)
+const fleetRoutes = require('./routes/fleetRoutes');
+app.use('/api/fleet', fleetRoutes);
+
 const aiRoutes = require('./routes/aiRoutes');
 app.use('/api/ai', aiRoutes);
 
@@ -150,7 +160,18 @@ mongoose
     useNewUrlParser: true,
     useUnifiedTopology: true,
   })
-  .then(() => console.log('✅ MongoDB connected successfully'))
+  .then(async () => {
+    console.log('✅ MongoDB connected successfully');
+
+    // Brings older driver records up to date with the fleet update. Safe to run
+    // on every start: once everything is migrated it finds nothing to do. A
+    // failure here is logged but never stops the server from starting.
+    try {
+      await runFleetMigration();
+    } catch (err) {
+      console.error('Fleet migration failed:', err.message);
+    }
+  })
   .catch((err) => console.log('❌ MongoDB connection error:', err));
 
 // Run message cleanup every hour
@@ -175,8 +196,9 @@ app.set("io", io);
 // ================= SOCKET AUTH =================
 // Verifies the JWT sent in socket.handshake.auth.token before any connection
 // is accepted, then looks the identity up in the DB so role/faculty/department
-// are trustworthy. Supports both regular users (User collection) and
-// shuttle drivers (Driver collection).
+// are trustworthy. The token's role decides which collection is checked:
+//   role 'driver'  -> Driver collection (fleet portal)
+//   anything else  -> User collection (UniWeb)
 io.use(async (socket, next) => {
   try {
     const token = socket.handshake.auth?.token;
@@ -184,32 +206,35 @@ io.use(async (socket, next) => {
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-    // Regular user first
-    const user = await User.findById(decoded.id).select('name role faculty department level');
-    if (user) {
-      socket.userData = {
-        id: user._id,
-        name: user.name,
-        role: user.role,
-        faculty: user.faculty,
-        department: user.department,
-        level: user.level,
-      };
-      return next();
-    }
+    // ----- Driver (or fleet admin) -----
+    if (decoded.role === 'driver') {
+      const driver = await Driver.findById(decoded.id).select('name accountStatus isFleetAdmin');
+      if (!driver) return next(new Error('User not found'));
 
-    // Otherwise, a driver
-    const driver = await Driver.findById(decoded.id).select('name');
-    if (driver) {
       socket.userData = {
         id: driver._id,
         name: driver.name,
         role: 'driver',
+        approved: driver.accountStatus === 'approved',
+        isFleetAdmin: !!driver.isFleetAdmin,
       };
       return next();
     }
 
-    return next(new Error('User not found'));
+    // ----- UniWeb user -----
+    const user = await User.findById(decoded.id).select('name role faculty department level isFleetHead');
+    if (!user) return next(new Error('User not found'));
+
+    socket.userData = {
+      id: user._id,
+      name: user.name,
+      role: user.role,
+      faculty: user.faculty,
+      department: user.department,
+      level: user.level,
+      isFleetHead: !!user.isFleetHead,
+    };
+    return next();
   } catch (err) {
     next(new Error('Authentication failed'));
   }
@@ -232,6 +257,99 @@ async function setDriverOffline(driverId) {
 }
 
 
+// ================= DRIVER SOCKETS =================
+// Drivers get their own small set of events. They never reach the chat, live
+// class or WebRTC handlers below, so a driver account cannot join student or
+// lecturer rooms or inject messages into them.
+
+function handleDriverSocket(socket) {
+  const user = socket.userData;
+  const driverId = String(user.id);
+
+  // Everyone hears about their own account (e.g. "you were approved")
+  socket.join(`driver_${driverId}`);
+  // Only approved drivers receive fleet-wide messages
+  if (user.approved) {
+    socket.join('fleet_drivers');
+    if (user.isFleetAdmin) socket.join('fleet_admins');
+  }
+
+  // Location + seats while on shift. Identity comes from the verified socket,
+  // never from the message, and the database must agree the driver is
+  // approved, has agreed to share location, and has a tricycle for today.
+  socket.on('driverLocation', async (data) => {
+    try {
+      const { lat, lng, availableSeats } = data || {};
+
+      // Valid coordinates only
+      const validCoord =
+        Number.isFinite(lat) && Number.isFinite(lng) &&
+        Math.abs(lat) <= 90 && Math.abs(lng) <= 180;
+      if (!validCoord) return;
+
+      // Seats must be a sane whole number; status is derived here, never
+      // taken from the client (findOneAndUpdate does not enforce the enum).
+      const seats =
+        Number.isInteger(availableSeats) && availableSeats >= 0 && availableSeats <= 20
+          ? availableSeats
+          : undefined;
+
+      const updatedAt = new Date();
+      const set = {
+        currentLocation: { lat, lng, updatedAt },
+        isOnShift: true,
+        status: seats === 0 ? 'full' : 'active',
+      };
+      if (seats !== undefined) set.availableSeats = seats;
+
+      // "Yesterday" is allowed so a shift that runs past midnight keeps working
+      const doc = await Driver.findOneAndUpdate(
+        {
+          _id: driverId,
+          accountStatus: 'approved',
+          locationConsent: true,
+          currentVehicle: { $ne: null },
+          checkedInDay: { $in: [lagosDay(), lagosDay(-1)] },
+        },
+        { $set: set },
+        { new: true }
+      ).select('totalSeats availableSeats');
+
+      if (!doc) return; // not allowed to broadcast: ignore silently
+
+      // Never show more free seats than the tricycle has
+      let outSeats = doc.availableSeats;
+      if (outSeats > doc.totalSeats) {
+        outSeats = doc.totalSeats;
+        await Driver.updateOne({ _id: driverId }, { $set: { availableSeats: outSeats } });
+      }
+
+      io.emit('driverLocationUpdate', {
+        driverId,
+        lat,
+        lng,
+        availableSeats: outSeats,
+        status: outSeats === 0 ? 'full' : 'active',
+        updatedAt,
+      });
+    } catch (err) {
+      console.error('Driver location error:', err.message);
+    }
+  });
+
+  // Driver ends their shift manually
+  socket.on('driverDisconnect', async () => {
+    await setDriverOffline(driverId);
+  });
+
+  // If the connection drops, take them off shift
+  socket.on('disconnect', async () => {
+    await setDriverOffline(driverId);
+    console.log('🔴 Driver disconnected:', socket.id);
+  });
+}
+
+
 // ================= ONLINE USERS =================
 
 let onlineUsers = [];
@@ -242,6 +360,17 @@ let onlineUsers = [];
 io.on("connection", (socket) => {
 
   console.log("🟢 Connected:", socket.id, "as", socket.userData?.name);
+
+  // Drivers are handled separately and never reach the handlers below
+  if (socket.userData?.role === 'driver') {
+    handleDriverSocket(socket);
+    return;
+  }
+
+  // Fleet Head and Super Admin receive fleet-admin alerts (e.g. SOS)
+  if (socket.userData?.isFleetHead || socket.userData?.role === 'admin') {
+    socket.join('fleet_admins');
+  }
 
 
 // ================= JOIN ROOM =================
@@ -371,66 +500,6 @@ io.on("connection", (socket) => {
   });
 
 
-  // ================= DRIVER LOCATION TRACKING =================
-  // Identity comes from the verified socket.userData (set in io.use above),
-  // so the client cannot update another driver's record by sending a
-  // different driverId. Any driverId/token fields sent by the client are ignored.
-
-  socket.on('driverLocation', async (data) => {
-    try {
-      const user = socket.userData;
-      if (!user || user.role !== 'driver') return;
-
-      const { lat, lng, availableSeats } = data || {};
-
-      // Valid coordinates only
-      const validCoord =
-        Number.isFinite(lat) && Number.isFinite(lng) &&
-        Math.abs(lat) <= 90 && Math.abs(lng) <= 180;
-      if (!validCoord) return;
-
-      // Seats must be a sane whole number; status is derived here, never
-      // taken from the client (findByIdAndUpdate does not enforce the enum).
-      const seats =
-        Number.isInteger(availableSeats) && availableSeats >= 0 && availableSeats <= 20
-          ? availableSeats
-          : undefined;
-      const status = seats === 0 ? 'full' : 'active';
-
-      const driverId = String(user.id);
-      const updatedAt = new Date();
-
-      const update = {
-        currentLocation: { lat, lng, updatedAt },
-        isOnShift: true,
-        status,
-      };
-      if (seats !== undefined) update.availableSeats = seats;
-
-      await Driver.findByIdAndUpdate(driverId, update);
-
-      // Broadcast to all connected clients (students)
-      io.emit('driverLocationUpdate', {
-        driverId,
-        lat,
-        lng,
-        availableSeats: seats,
-        status,
-        updatedAt,
-      });
-    } catch (err) {
-      console.error('Driver location error:', err.message);
-    }
-  });
-
-  // Driver ends shift manually
-  socket.on('driverDisconnect', async () => {
-    const user = socket.userData;
-    if (!user || user.role !== 'driver') return;
-    await setDriverOffline(user.id);
-  });
-
-
   // ================= WEBRTC OFFER =================
 
   socket.on("webrtc-offer", ({ offer, room }) => {
@@ -492,11 +561,6 @@ io.on("connection", (socket) => {
 
     io.emit("onlineUsers", onlineUsers);
 
-    // If a driver's connection drops, take them off shift
-    if (socket.userData?.role === 'driver') {
-      await setDriverOffline(socket.userData.id);
-    }
-
     console.log("🔴 Disconnected:", socket.id);
 
   });
@@ -506,7 +570,7 @@ io.on("connection", (socket) => {
 
 // ================= STALE DRIVER SWEEP =================
 // Marks drivers offline when their phone stops sending location for 5 minutes.
-// (The driver app should send a heartbeat every ~30s even when parked, so a
+// (The driver app sends a heartbeat every ~20s even when parked, so a
 // connected-but-stationary driver is not swept.)
 
 const STALE_MS = 5 * 60 * 1000;
