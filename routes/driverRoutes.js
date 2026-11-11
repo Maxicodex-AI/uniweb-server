@@ -93,6 +93,9 @@ router.post('/register', async (req, res) => {
       target: { kind: 'driver', id: driver._id, label: `${driver.name} (${driver.phone})` },
     });
 
+    // Live badge in the fleet portal
+    req.app.get('io').to('fleet_admins').emit('driverRegistered', { name: driver.name });
+
     res.status(201).json({ token: signToken(driver), driver: publicDriver(driver) });
   } catch (err) {
     if (err && err.code === 11000) {

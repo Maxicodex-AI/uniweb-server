@@ -176,7 +176,12 @@ router.get('/me', fleetAuth, async (req, res) => {
       Vehicle.countDocuments({ status: 'available' }),
     ]);
     res.json({
-      actor: { kind: req.fleetActor.kind, name: req.fleetActor.name, isHead: req.fleetActor.isHead },
+      actor: {
+        id: String(req.fleetActor.id),
+        kind: req.fleetActor.kind,
+        name: req.fleetActor.name,
+        isHead: req.fleetActor.isHead,
+      },
       today: lagosDay(),
       counts: { pending, approved, suspended, onShift, vehicles },
     });
