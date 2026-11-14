@@ -43,6 +43,9 @@ const driverSchema = new mongoose.Schema(
 
     // ===== Live status =====
     isOnShift: { type: Boolean, default: false },
+    // When the current shift began (null while off shift). The driver app uses
+    // it for the "on shift for 02:14:35" timer, so it survives a page reload.
+    shiftStartedAt: { type: Date, default: null },
     isActive: { type: Boolean, default: true },
     currentLocation: {
       lat: { type: Number, default: null },

@@ -69,6 +69,7 @@ async function takeOffShift(io, driverId) {
     {
       $set: {
         isOnShift: false,
+        shiftStartedAt: null,
         status: 'offline',
         'currentLocation.lat': null,
         'currentLocation.lng': null,
@@ -716,7 +717,7 @@ router.get('/announcements', fleetAuth, async (req, res) => {
 router.get('/live', fleetAuth, async (req, res) => {
   try {
     const drivers = await Driver.find({ accountStatus: 'approved', isOnShift: true })
-      .select('name phone tricycleNumber totalSeats availableSeats status currentLocation')
+      .select('name phone tricycleNumber totalSeats availableSeats status currentLocation shiftStartedAt')
       .lean();
     res.json(drivers);
   } catch (err) {

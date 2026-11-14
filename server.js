@@ -248,6 +248,7 @@ async function setDriverOffline(driverId) {
   try {
     await Driver.findByIdAndUpdate(driverId, {
       isOnShift: false,
+      shiftStartedAt: null,
       status: 'offline',
     });
     io.emit('driverOffline', { driverId: String(driverId) });
@@ -313,9 +314,14 @@ function handleDriverSocket(socket) {
         },
         { $set: set },
         { new: true }
-      ).select('totalSeats availableSeats');
+      ).select('totalSeats availableSeats shiftStartedAt');
 
       if (!doc) return; // not allowed to broadcast: ignore silently
+
+      // A shift revived after a dropped connection has no start time yet
+      if (!doc.shiftStartedAt) {
+        await Driver.updateOne({ _id: driverId, shiftStartedAt: null }, { $set: { shiftStartedAt: updatedAt } });
+      }
 
       // Never show more free seats than the tricycle has
       let outSeats = doc.availableSeats;
@@ -593,6 +599,7 @@ setInterval(async () => {
       { _id: { $in: ids } },
       {
         isOnShift: false,
+        shiftStartedAt: null,
         status: 'offline',
         'currentLocation.lat': null,
         'currentLocation.lng': null,

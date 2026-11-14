@@ -131,6 +131,8 @@ router.get('/me', driverAuth, async (req, res) => {
     ...publicDriver(req.driver),
     today,
     greeting: greeting(),
+    // The app uses the server's clock for the shift timer, so a wrong phone clock cannot skew it
+    serverNow: new Date().toISOString(),
     checkedInToday: req.driver.checkedInDay === today,
     needsConsent: !req.driver.locationConsent,
   });
@@ -248,7 +250,15 @@ router.put('/start-shift', driverAuth, requireApproved, async (req, res) => {
 
     const updated = await Driver.findByIdAndUpdate(
       driver._id,
-      { $set: { isOnShift: true, status: 'active', availableSeats: driver.totalSeats } },
+      {
+        $set: {
+          isOnShift: true,
+          status: 'active',
+          availableSeats: driver.totalSeats,
+          // Starting again while already on shift keeps the original start time
+          shiftStartedAt: driver.isOnShift && driver.shiftStartedAt ? driver.shiftStartedAt : new Date(),
+        },
+      },
       { new: true }
     ).select('-password -reviewedBy');
 
@@ -261,7 +271,7 @@ router.put('/start-shift', driverAuth, requireApproved, async (req, res) => {
       status: updated.status,
     });
 
-    res.json(updated);
+    res.json({ ...updated.toObject(), serverNow: new Date().toISOString() });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
   }
@@ -275,6 +285,7 @@ router.put('/end-shift', driverAuth, async (req, res) => {
       {
         $set: {
           isOnShift: false,
+          shiftStartedAt: null,
           status: 'offline',
           'currentLocation.lat': null,
           'currentLocation.lng': null,
