@@ -22,6 +22,7 @@ const Vehicle = require('../models/Vehicle');
 const CheckIn = require('../models/CheckIn');
 const FleetAudit = require('../models/FleetAudit');
 const FleetAnnouncement = require('../models/FleetAnnouncement');
+const SosAlert = require('../models/SosAlert');
 const { logAudit } = require('../utils/fleetAudit');
 const { lagosDay } = require('../utils/fleetTime');
 
@@ -169,12 +170,13 @@ router.delete('/head', auth, authorizeRole('admin'), async (req, res) => {
 // ----- Who am I, and the numbers for the dashboard -----
 router.get('/me', fleetAuth, async (req, res) => {
   try {
-    const [pending, approved, suspended, onShift, vehicles] = await Promise.all([
+    const [pending, approved, suspended, onShift, vehicles, sos] = await Promise.all([
       Driver.countDocuments({ accountStatus: 'pending' }),
       Driver.countDocuments({ accountStatus: 'approved' }),
       Driver.countDocuments({ accountStatus: 'suspended' }),
       Driver.countDocuments({ accountStatus: 'approved', isOnShift: true }),
       Vehicle.countDocuments({ status: 'available' }),
+      SosAlert.countDocuments({ active: true }),
     ]);
     res.json({
       actor: {
@@ -184,7 +186,7 @@ router.get('/me', fleetAuth, async (req, res) => {
         isHead: req.fleetActor.isHead,
       },
       today: lagosDay(),
-      counts: { pending, approved, suspended, onShift, vehicles },
+      counts: { pending, approved, suspended, onShift, vehicles, sos },
     });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
@@ -721,6 +723,98 @@ router.get('/live', fleetAuth, async (req, res) => {
       .lean();
     res.json(drivers);
   } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ----- SOS alerts -----
+// Raised by drivers (see driverRoutes.js). Every fleet actor can see them and
+// respond, except that nobody handles an alert raised by their own account.
+
+const sosTarget = alert => ({ kind: 'driver', id: alert.driver, label: `${alert.driverName} (${alert.driverPhone})` });
+
+function ownSos(req, res, alert) {
+  if (req.fleetActor.kind === 'admin' && sameId(req.fleetActor.id, alert.driver)) {
+    res.status(403).json({ message: 'You cannot handle your own alert. Another admin must respond.' });
+    return true;
+  }
+  return false;
+}
+
+router.get('/sos', fleetAuth, async (req, res) => {
+  try {
+    const [active, recent] = await Promise.all([
+      SosAlert.find({ active: true }).sort({ createdAt: -1 }).lean(),
+      SosAlert.find({ active: false }).sort({ updatedAt: -1 }).limit(20).lean(),
+    ]);
+    res.json({ active, recent });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// "I have seen this and I am responding": stops the alarm for everyone
+router.put('/sos/:id/acknowledge', fleetAuth, async (req, res) => {
+  try {
+    if (!isId(req.params.id)) return res.status(400).json({ message: 'Invalid id' });
+    const alert = await SosAlert.findById(req.params.id);
+    if (!alert) return res.status(404).json({ message: 'Alert not found' });
+    if (!alert.active) return res.status(400).json({ message: 'This alert is already closed' });
+    if (ownSos(req, res, alert)) return;
+
+    // Atomic: if two admins tap at the same moment, only one wins
+    const updated = await SosAlert.findOneAndUpdate(
+      { _id: alert._id, active: true, status: 'open' },
+      { $set: { status: 'acknowledged', acknowledgedBy: actorRef(req), acknowledgedAt: new Date() } },
+      { new: true }
+    );
+    if (!updated) {
+      const current = await SosAlert.findById(alert._id);
+      return res.json({
+        alert: current,
+        message: `Already acknowledged by ${current?.acknowledgedBy?.name || 'another admin'}`,
+      });
+    }
+
+    const io = req.app.get('io');
+    io.to('fleet_admins').emit('sosUpdate', updated.toObject());
+    io.to(`driver_${updated.driver}`).emit('sosStatus', { status: 'acknowledged', by: req.fleetActor.name });
+
+    await logAudit({ action: 'sos.acknowledge', actor: actorRef(req), target: sosTarget(updated) });
+    res.json({ alert: updated, message: 'Acknowledged. Please contact the driver now.' });
+  } catch (err) {
+    console.error('SOS acknowledge error:', err.message);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Close the alert with a note on what happened
+router.put('/sos/:id/resolve', fleetAuth, async (req, res) => {
+  try {
+    if (!isId(req.params.id)) return res.status(400).json({ message: 'Invalid id' });
+    const note = clean(req.body.note, 300);
+    if (note.length < 3) return res.status(400).json({ message: 'Please write what happened' });
+
+    const alert = await SosAlert.findById(req.params.id);
+    if (!alert) return res.status(404).json({ message: 'Alert not found' });
+    if (!alert.active) return res.status(400).json({ message: 'This alert is already closed' });
+    if (ownSos(req, res, alert)) return;
+
+    const updated = await SosAlert.findOneAndUpdate(
+      { _id: alert._id, active: true },
+      { $set: { status: 'resolved', active: false, resolvedBy: actorRef(req), resolvedAt: new Date(), note } },
+      { new: true }
+    );
+    if (!updated) return res.status(400).json({ message: 'This alert was just closed by someone else' });
+
+    const io = req.app.get('io');
+    io.to('fleet_admins').emit('sosUpdate', updated.toObject());
+    io.to(`driver_${updated.driver}`).emit('sosStatus', { status: 'resolved', by: req.fleetActor.name, note });
+
+    await logAudit({ action: 'sos.resolve', actor: actorRef(req), target: sosTarget(updated), details: { note } });
+    res.json({ alert: updated, message: 'Alert closed' });
+  } catch (err) {
+    console.error('SOS resolve error:', err.message);
     res.status(500).json({ message: 'Server error' });
   }
 });

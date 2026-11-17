@@ -13,6 +13,7 @@ const Vehicle = require('../models/Vehicle');
 const CheckIn = require('../models/CheckIn');
 const User = require('../models/user');
 const FleetAnnouncement = require('../models/FleetAnnouncement');
+const SosAlert = require('../models/SosAlert');
 const { driverAuth, requireApproved } = require('../middleware/driverAuth');
 const { lagosDay, greeting } = require('../utils/fleetTime');
 const { logAudit } = require('../utils/fleetAudit');
@@ -127,8 +128,11 @@ router.post('/login', async (req, res) => {
 // ===== MY PROFILE (any status, so pending/rejected/suspended drivers can see why) =====
 router.get('/me', driverAuth, async (req, res) => {
   const today = lagosDay();
+  // An alert still open after a page reload, so the SOS screen can come back
+  const activeSos = await SosAlert.findOne({ driver: req.driver._id, active: true }).lean();
   res.json({
     ...publicDriver(req.driver),
+    activeSos,
     today,
     greeting: greeting(),
     // The app uses the server's clock for the shift timer, so a wrong phone clock cannot skew it
@@ -368,6 +372,97 @@ router.post('/announcements/:id/read', driverAuth, async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     res.status(400).json({ message: 'Invalid announcement' });
+  }
+});
+
+// ===== SOS =====
+// A driver in trouble raises an alert. Every fleet admin with the portal open
+// hears an alarm and sees the tricycle, the driver's phone and live location.
+
+// Raise an alert. Safe to call twice: a second call returns the alert already open.
+router.post('/sos', driverAuth, requireApproved, async (req, res) => {
+  try {
+    const driver = req.driver;
+
+    const existing = await SosAlert.findOne({ driver: driver._id, active: true });
+    if (existing) return res.json({ alert: existing, already: true });
+
+    // Stops a stuck button or a mischievous script from flooding the admins
+    const recent = await SosAlert.countDocuments({
+      driver: driver._id,
+      createdAt: { $gte: new Date(Date.now() - 60 * 60 * 1000) },
+    });
+    if (recent >= 5) {
+      return res.status(429).json({ message: 'Too many alerts in the last hour. Please call campus security.' });
+    }
+
+    // Use the position the phone sent; otherwise the last known one
+    const { lat, lng } = req.body || {};
+    const sentPos =
+      typeof lat === 'number' && typeof lng === 'number' &&
+      Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180;
+    const known = driver.currentLocation && driver.currentLocation.lat != null;
+    const location = sentPos
+      ? { lat, lng, updatedAt: new Date() }
+      : known
+        ? { lat: driver.currentLocation.lat, lng: driver.currentLocation.lng, updatedAt: driver.currentLocation.updatedAt }
+        : { lat: null, lng: null, updatedAt: null };
+
+    let alert;
+    try {
+      alert = await SosAlert.create({
+        driver: driver._id,
+        driverName: driver.name,
+        driverPhone: driver.phone,
+        vehicleNumber: driver.tricycleNumber || '',
+        location,
+      });
+    } catch (err) {
+      if (err && err.code === 11000) {
+        // Two taps at once: the unique index let only one through
+        const again = await SosAlert.findOne({ driver: driver._id, active: true });
+        return res.json({ alert: again, already: true });
+      }
+      throw err;
+    }
+
+    req.app.get('io').to('fleet_admins').emit('sosAlert', alert.toObject());
+
+    await logAudit({
+      action: 'sos.raise',
+      actor: { kind: 'driver', id: driver._id, name: driver.name },
+      target: { kind: 'driver', id: driver._id, label: `${driver.name} (${driver.phone})` },
+      details: { vehicle: alert.vehicleNumber, hasLocation: location.lat != null },
+    });
+
+    res.status(201).json({ alert });
+  } catch (err) {
+    console.error('SOS raise error:', err.message);
+    res.status(500).json({ message: 'Could not send the alert. Please call campus security.' });
+  }
+});
+
+// The driver says they are safe
+router.post('/sos/cancel', driverAuth, async (req, res) => {
+  try {
+    const alert = await SosAlert.findOneAndUpdate(
+      { driver: req.driver._id, active: true },
+      { $set: { status: 'cancelled', active: false, cancelledAt: new Date() } },
+      { new: true }
+    );
+    if (!alert) return res.status(404).json({ message: 'There is no active alert' });
+
+    req.app.get('io').to('fleet_admins').emit('sosUpdate', alert.toObject());
+
+    await logAudit({
+      action: 'sos.cancel',
+      actor: { kind: 'driver', id: req.driver._id, name: req.driver.name },
+      target: { kind: 'driver', id: req.driver._id, label: `${req.driver.name} (${req.driver.phone})` },
+    });
+
+    res.json({ alert });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
   }
 });
 

@@ -17,6 +17,7 @@ const User = require('./models/user');
 const Driver = require('./models/Driver'); // NOTE: filename case must match exactly on Linux hosts
 const { lagosDay } = require('./utils/fleetTime');
 const { runFleetMigration } = require('./utils/fleetMigration');
+const SosAlert = require('./models/SosAlert');
 const { cleanupDeletedMessages } = require('./utils/cleanupHelper');
 
 
@@ -340,6 +341,35 @@ function handleDriverSocket(socket) {
       });
     } catch (err) {
       console.error('Driver location error:', err.message);
+    }
+  });
+
+  // Live position while an SOS alert is active. Separate from shift tracking, so
+  // an alert raised off shift never puts the driver on the public map.
+  let lastSosLocation = 0;
+  socket.on('sosLocation', async (data) => {
+    try {
+      const now = Date.now();
+      if (now - lastSosLocation < 1000) return; // at most one update a second
+      lastSosLocation = now;
+
+      const { lat, lng } = data || {};
+      const validCoord =
+        Number.isFinite(lat) && Number.isFinite(lng) &&
+        Math.abs(lat) <= 90 && Math.abs(lng) <= 180;
+      if (!validCoord) return;
+
+      const updatedAt = new Date();
+      const alert = await SosAlert.findOneAndUpdate(
+        { driver: driverId, active: true },
+        { $set: { location: { lat, lng, updatedAt } } },
+        { new: true }
+      ).select('_id');
+      if (!alert) return; // no active alert: ignore
+
+      io.to('fleet_admins').emit('sosLocation', { alertId: String(alert._id), lat, lng, updatedAt });
+    } catch (err) {
+      console.error('SOS location error:', err.message);
     }
   });
 
