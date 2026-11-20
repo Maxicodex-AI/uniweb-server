@@ -117,6 +117,10 @@ app.use('/api/drivers', driverRoutes);
 const fleetRoutes = require('./routes/fleetRoutes');
 app.use('/api/fleet', fleetRoutes);
 
+// student reports about tricycles
+const complaintRoutes = require('./routes/complaintRoutes');
+app.use('/api/complaints', complaintRoutes);
+
 const aiRoutes = require('./routes/aiRoutes');
 app.use('/api/ai', aiRoutes);
 

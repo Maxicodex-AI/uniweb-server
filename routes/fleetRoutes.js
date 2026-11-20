@@ -23,6 +23,8 @@ const CheckIn = require('../models/CheckIn');
 const FleetAudit = require('../models/FleetAudit');
 const FleetAnnouncement = require('../models/FleetAnnouncement');
 const SosAlert = require('../models/SosAlert');
+const Complaint = require('../models/Complaint');
+const { CATEGORIES } = require('../utils/complaintCategories');
 const { logAudit } = require('../utils/fleetAudit');
 const { lagosDay } = require('../utils/fleetTime');
 
@@ -91,6 +93,27 @@ function dropFromAdminRoom(io, driverId) {
   } catch (e) {
     /* older socket.io: harmless, the next connection will not join */
   }
+}
+
+// ----- Student reports (complaints) visibility -----
+// Fleet admins are drivers, so they never see reports about fleet admins (that
+// stays with the Fleet Head), and they never see who the reporter is.
+async function complaintScope(req) {
+  if (req.fleetActor.isHead) return {};
+  const adminIds = await Driver.find({ isFleetAdmin: true }).distinct('_id');
+  return adminIds.length ? { driver: { $nin: adminIds } } : {};
+}
+
+function complaintForActor(req, c) {
+  const o = { ...c, categoryLabel: CATEGORIES[c.category]?.label || c.category };
+  if (!req.fleetActor.isHead) {
+    delete o.reporter;
+    delete o.reporterName;
+    delete o.reporterEmail;
+    delete o.reporterPhone;
+    o.reporterHidden = true;
+  }
+  return o;
 }
 
 // =====================================================================
@@ -170,13 +193,14 @@ router.delete('/head', auth, authorizeRole('admin'), async (req, res) => {
 // ----- Who am I, and the numbers for the dashboard -----
 router.get('/me', fleetAuth, async (req, res) => {
   try {
-    const [pending, approved, suspended, onShift, vehicles, sos] = await Promise.all([
+    const [pending, approved, suspended, onShift, vehicles, sos, complaints] = await Promise.all([
       Driver.countDocuments({ accountStatus: 'pending' }),
       Driver.countDocuments({ accountStatus: 'approved' }),
       Driver.countDocuments({ accountStatus: 'suspended' }),
       Driver.countDocuments({ accountStatus: 'approved', isOnShift: true }),
       Vehicle.countDocuments({ status: 'available' }),
       SosAlert.countDocuments({ active: true }),
+      complaintScope(req).then(scope => Complaint.countDocuments({ ...scope, status: 'new' })),
     ]);
     res.json({
       actor: {
@@ -186,7 +210,7 @@ router.get('/me', fleetAuth, async (req, res) => {
         isHead: req.fleetActor.isHead,
       },
       today: lagosDay(),
-      counts: { pending, approved, suspended, onShift, vehicles, sos },
+      counts: { pending, approved, suspended, onShift, vehicles, sos, complaints },
     });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
@@ -815,6 +839,112 @@ router.put('/sos/:id/resolve', fleetAuth, async (req, res) => {
     res.json({ alert: updated, message: 'Alert closed' });
   } catch (err) {
     console.error('SOS resolve error:', err.message);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ----- Student reports -----
+router.get('/complaints', fleetAuth, async (req, res) => {
+  try {
+    const filter = { ...(await complaintScope(req)) };
+    const f = req.query.filter;
+    if (f === 'resolved') filter.status = 'resolved';
+    else if (f === 'dismissed') filter.status = 'dismissed';
+    else if (f !== 'all') filter.status = { $in: ['new', 'in_review'] };
+
+    if (req.query.q) {
+      const rx = new RegExp(escapeRegex(clean(req.query.q, 60)), 'i');
+      filter.$or = [{ vehicleNumber: rx }, { driverName: rx }, { message: rx }];
+    }
+
+    const list = await Complaint.find(filter).sort({ createdAt: -1 }).limit(200).lean();
+    const rank = s => (s === 'new' ? 0 : s === 'in_review' ? 1 : 2);
+    list.sort(
+      (a, b) =>
+        rank(a.status) - rank(b.status) ||
+        (b.priority === 'high') - (a.priority === 'high') ||
+        new Date(b.createdAt) - new Date(a.createdAt)
+    );
+    res.json(list.map(c => complaintForActor(req, c)));
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.get('/complaints/:id', fleetAuth, async (req, res) => {
+  try {
+    if (!isId(req.params.id)) return res.status(400).json({ message: 'Invalid id' });
+    const scope = await complaintScope(req);
+    const c = await Complaint.findOne({ _id: req.params.id, ...scope }).lean();
+    if (!c) return res.status(404).json({ message: 'Report not found' });
+
+    // A pattern matters: how many other reports name the same driver lately?
+    const related = c.driver
+      ? await Complaint.countDocuments({
+          driver: c.driver,
+          _id: { $ne: c._id },
+          createdAt: { $gte: new Date(Date.now() - 90 * 24 * 3600 * 1000) },
+        })
+      : 0;
+
+    res.json({ complaint: complaintForActor(req, c), related });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// new -> in_review -> resolved / dismissed (and reopen). Resolved and dismissed
+// need a message, which the reporter sees.
+router.put('/complaints/:id/status', fleetAuth, async (req, res) => {
+  try {
+    if (!isId(req.params.id)) return res.status(400).json({ message: 'Invalid id' });
+    const status = req.body.status;
+    if (!['in_review', 'resolved', 'dismissed'].includes(status)) {
+      return res.status(400).json({ message: 'Invalid status' });
+    }
+    const resolution = clean(req.body.resolution, 500);
+    if ((status === 'resolved' || status === 'dismissed') && resolution.length < 3) {
+      return res.status(400).json({ message: 'Please write a short message for the reporter' });
+    }
+
+    const scope = await complaintScope(req);
+    const c = await Complaint.findOne({ _id: req.params.id, ...scope });
+    if (!c) return res.status(404).json({ message: 'Report not found' });
+
+    c.status = status;
+    c.resolution = status === 'in_review' ? '' : resolution;
+    c.handledBy = actorRef(req);
+    c.statusChangedAt = new Date();
+    await c.save();
+
+    await logAudit({
+      action: 'complaint.status',
+      actor: actorRef(req),
+      target: c.driver ? { kind: 'driver', id: c.driver, label: c.driverName } : null,
+      details: { status, vehicle: c.vehicleNumber, category: c.category },
+    });
+    res.json({ complaint: complaintForActor(req, c.toObject()), message: `Report marked ${status.replace('_', ' ')}` });
+  } catch (err) {
+    console.error('Complaint status error:', err.message);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Internal notes, never shown to the reporter
+router.post('/complaints/:id/notes', fleetAuth, async (req, res) => {
+  try {
+    if (!isId(req.params.id)) return res.status(400).json({ message: 'Invalid id' });
+    const text = clean(req.body.text, 500);
+    if (text.length < 2) return res.status(400).json({ message: 'Write a note first' });
+
+    const scope = await complaintScope(req);
+    const c = await Complaint.findOne({ _id: req.params.id, ...scope });
+    if (!c) return res.status(404).json({ message: 'Report not found' });
+
+    c.notes.push({ text, by: actorRef(req), at: new Date() });
+    await c.save();
+    res.json({ complaint: complaintForActor(req, c.toObject()), message: 'Note added' });
+  } catch (err) {
     res.status(500).json({ message: 'Server error' });
   }
 });
