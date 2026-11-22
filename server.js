@@ -121,6 +121,10 @@ app.use('/api/fleet', fleetRoutes);
 const complaintRoutes = require('./routes/complaintRoutes');
 app.use('/api/complaints', complaintRoutes);
 
+// health portal: school health details, Health Head, providers
+const healthRoutes = require('./routes/healthRoutes');
+app.use('/api/health', healthRoutes);
+
 const aiRoutes = require('./routes/aiRoutes');
 app.use('/api/ai', aiRoutes);
 

@@ -64,6 +64,14 @@ const userSchema = new mongoose.Schema(
       default: false,
     },
 
+    // Health Head: the one staff member the Super Admin appoints to run the
+    // school's health portal. Keeps their normal role; this flag only unlocks
+    // the health admin portal. At most one user can hold it (see index below).
+    isHealthHead: {
+      type: Boolean,
+      default: false,
+    },
+
     avatarColor: {
       type: String,
       default: '#16a34a',
@@ -119,6 +127,12 @@ const userSchema = new mongoose.Schema(
 userSchema.index(
   { isFleetHead: 1 },
   { unique: true, partialFilterExpression: { isFleetHead: true } }
+);
+
+// Only one Health Head at a time: the database itself refuses a second one.
+userSchema.index(
+  { isHealthHead: 1 },
+  { unique: true, partialFilterExpression: { isHealthHead: true } }
 );
 
 const User = mongoose.model('User', userSchema);
