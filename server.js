@@ -125,6 +125,10 @@ app.use('/api/complaints', complaintRoutes);
 const healthRoutes = require('./routes/healthRoutes');
 app.use('/api/health', healthRoutes);
 
+// providers: pharmacies, clinics and shops (their own sign-in)
+const providerRoutes = require('./routes/providerRoutes');
+app.use('/api/providers', providerRoutes);
+
 const aiRoutes = require('./routes/aiRoutes');
 app.use('/api/ai', aiRoutes);
 

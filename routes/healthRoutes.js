@@ -16,6 +16,9 @@ const healthAuth = require('../middleware/healthAuth');
 const User = require('../models/user');
 const HealthSettings = require('../models/HealthSettings');
 const HealthAudit = require('../models/HealthAudit');
+const Provider = require('../models/Provider');
+const { publicProvider } = require('../utils/openStatus');
+const { validateHours, cleanServices } = require('../utils/healthValidate');
 
 const isId = v => mongoose.isValidObjectId(v);
 const clean = (v, max) => String(v == null ? '' : v).trim().slice(0, max);
@@ -155,7 +158,11 @@ router.delete('/head', auth, authorizeRole('admin'), async (req, res) => {
 
 // ===== HEALTH ADMIN PORTAL =====
 router.get('/me', healthAuth, async (req, res) => {
-  res.json({ actor: { id: String(req.healthActor.id), kind: req.healthActor.kind, name: req.healthActor.name } });
+  const pendingProviders = await Provider.countDocuments({ accountStatus: 'pending' });
+  res.json({
+    actor: { id: String(req.healthActor.id), kind: req.healthActor.kind, name: req.healthActor.name },
+    counts: { pendingProviders },
+  });
 });
 
 router.get('/settings', healthAuth, async (req, res) => {
@@ -187,6 +194,112 @@ router.put('/settings', healthAuth, async (req, res) => {
     res.json({ settings: saved, message: changed.length ? 'Saved' : 'Nothing changed' });
   } catch (err) {
     console.error('Health settings error:', err.message);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ----- Providers: approvals (Health Head or Super Admin) -----
+const PROVIDER_STATUSES = ['pending', 'approved', 'rejected', 'suspended'];
+const escapeRegex = s => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const providerLabel = p => ({ kind: 'provider', id: p._id, label: `${p.businessName} (${p.type})` });
+
+router.get('/providers', healthAuth, async (req, res) => {
+  try {
+    const filter = {};
+    if (PROVIDER_STATUSES.includes(req.query.status)) filter.accountStatus = req.query.status;
+    if (['pharmacy', 'clinic', 'shop'].includes(req.query.type)) filter.type = req.query.type;
+    if (req.query.q) {
+      const rx = new RegExp(escapeRegex(clean(req.query.q, 60)), 'i');
+      filter.$or = [{ businessName: rx }, { ownerName: rx }, { phone: rx }, { address: rx }];
+    }
+    res.json(await Provider.find(filter).select('-password').sort({ createdAt: -1 }).limit(300).lean());
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+async function loadProvider(req, res) {
+  if (!isId(req.params.id)) { res.status(400).json({ message: 'Invalid id' }); return null; }
+  const p = await Provider.findById(req.params.id).select('-password');
+  if (!p) { res.status(404).json({ message: 'Provider not found' }); return null; }
+  return p;
+}
+
+router.get('/providers/:id', healthAuth, async (req, res) => {
+  try {
+    const p = await loadProvider(req, res);
+    if (!p) return;
+    const history = await HealthAudit.find({ 'target.id': p._id }).sort({ createdAt: -1 }).limit(30).lean();
+    res.json({ provider: p, history });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Approve: the Health Head confirms they checked the business in person
+router.put('/providers/:id/approve', healthAuth, async (req, res) => {
+  try {
+    const p = await loadProvider(req, res);
+    if (!p) return;
+    if (!['pending', 'rejected'].includes(p.accountStatus)) {
+      return res.status(400).json({ message: 'Only pending or rejected applications can be approved' });
+    }
+    if ((req.body || {}).verifiedInPerson !== true) {
+      return res.status(400).json({ message: 'Please confirm you checked this business in person' });
+    }
+    await Provider.updateOne({ _id: p._id }, { $set: {
+      accountStatus: 'approved', statusReason: null, verifiedInPerson: true,
+      reviewedBy: actorRef(req), reviewedAt: new Date(),
+    } });
+    await logAudit({ action: 'provider.approve', actor: actorRef(req), target: providerLabel(p) });
+    res.json({ message: `${p.businessName} approved. Students can now see it.` });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+async function closeProvider(req, res, { from, to, action }) {
+  try {
+    const p = await loadProvider(req, res);
+    if (!p) return;
+    if (!from.includes(p.accountStatus)) return res.status(400).json({ message: `Only ${from.join(' or ')} providers can be ${to}` });
+    const reason = clean((req.body || {}).reason, 300);
+    if (reason.length < 3) return res.status(400).json({ message: 'A reason is required' });
+    await Provider.updateOne({ _id: p._id }, { $set: {
+      accountStatus: to, statusReason: reason, reviewedBy: actorRef(req), reviewedAt: new Date(),
+    } });
+    await logAudit({ action, actor: actorRef(req), target: providerLabel(p), details: { reason } });
+    res.json({ message: `${p.businessName} ${to}` });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+}
+router.put('/providers/:id/reject', healthAuth, (req, res) => closeProvider(req, res, { from: ['pending'], to: 'rejected', action: 'provider.reject' }));
+// Suspending hides the listing from students at once
+router.put('/providers/:id/suspend', healthAuth, (req, res) => closeProvider(req, res, { from: ['approved'], to: 'suspended', action: 'provider.suspend' }));
+
+router.put('/providers/:id/reinstate', healthAuth, async (req, res) => {
+  try {
+    const p = await loadProvider(req, res);
+    if (!p) return;
+    if (p.accountStatus !== 'suspended') return res.status(400).json({ message: 'Only suspended providers can be reinstated' });
+    await Provider.updateOne({ _id: p._id }, { $set: { accountStatus: 'approved', statusReason: null, reviewedBy: actorRef(req), reviewedAt: new Date() } });
+    await logAudit({ action: 'provider.reinstate', actor: actorRef(req), target: providerLabel(p) });
+    res.json({ message: `${p.businessName} reinstated` });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ----- Students: the directory of approved places -----
+router.get('/directory', auth, async (req, res) => {
+  try {
+    const filter = { accountStatus: 'approved' };
+    if (['pharmacy', 'clinic', 'shop'].includes(req.query.type)) filter.type = req.query.type;
+    const list = await Provider.find(filter).select('-password -reviewedBy -email -ownerName').lean();
+    const now = new Date();
+    res.json({ places: list.map(p => publicProvider(p, now)), serverNow: now.toISOString() });
+  } catch (err) {
     res.status(500).json({ message: 'Server error' });
   }
 });

@@ -17,7 +17,7 @@ const auth = async (req, res, next) => {
 
     // Driver tokens belong to the fleet portal only. They are never valid
     // for UniWeb routes, even though they are signed with the same secret.
-    if (decoded.role === 'driver') {
+    if (decoded.role === 'driver' || decoded.role === 'provider') {
       return res.status(401).json({ message: 'Not authorized for this portal' });
     }
 
